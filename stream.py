@@ -1649,10 +1649,11 @@ class ViewerEngine:
 
 
 class GatewayStreamEngine:
-    def __init__(self, state: State, session: Session, console: Console) -> None:
+    def __init__(self, state: State, session: Session, console: Console, auto_mode: bool = False) -> None:
         self.state = state
         self.session = session
         self.console = console
+        self.auto_mode = auto_mode
         self.ws: MiniWebSocket | None = None
         self.voice_conn: VoiceConnection | None = None
         self.stream_conn: VoiceConnection | None = None
@@ -1784,7 +1785,23 @@ class GatewayStreamEngine:
             C.info("no active voice channel detected on discord client.")
             target_guild_id = ""
             target_channel_id = ""
-            while True:
+            if self.auto_mode and self.state.last_channel_id:
+                default_cid = self.state.last_channel_id
+                cid = extract_channel_id(default_cid)
+                valid, gid, name = validate_stream_target(
+                    token=self.state.token,
+                    super_props=self.session.super_props,
+                    channel_id=cid,
+                    console=C,
+                )
+                if valid:
+                    target_channel_id = cid
+                    target_guild_id = gid
+                    self.channel_name = name
+                    self.state.last_guild_id = gid
+                    self.state.last_channel_id = cid
+                    self.state.save()
+            while not target_channel_id:
                 default_cid = self.state.last_channel_id
                 prompt_str = f"  {C.GREY}voice channel id (or link)" + (f" [default: {default_cid}]:{C.RESET} " if default_cid else f":{C.RESET} ")
                 raw_in = input(prompt_str).strip()
@@ -2714,10 +2731,11 @@ def inspect_profile(state: State, session: Session, console: Console) -> None:
 
 
 class StreamMaximizerApp:
-    def __init__(self) -> None:
+    def __init__(self, auto_mode: bool = False) -> None:
         self.console = Console()
         self.state = State.load()
         self.session: Session | None = None
+        self.auto_mode = auto_mode
 
     def start(self) -> None:
         C = self.console
@@ -2755,7 +2773,10 @@ class StreamMaximizerApp:
             C.err("crypto", "cryptography package is MISSING! Live video streaming will NOT work. Run: pip install -r requirements.txt")
 
         time.sleep(0.5)
-        self.menu()
+        if self.auto_mode:
+            self.run_gateway_live_streamer()
+        else:
+            self.menu()
 
     def _new_session(self) -> None:
         self.session = Session.new()
@@ -2847,7 +2868,7 @@ class StreamMaximizerApp:
         C.warn("rule 2", f"Discord Settings → Data & Privacy → {C.YELLOW}'Personalize my experience'{C.RESET} must be {C.GREEN}ON{C.RESET}!")
         print()
 
-        engine = GatewayStreamEngine(self.state, self.session, self.console)
+        engine = GatewayStreamEngine(self.state, self.session, self.console, auto_mode=self.auto_mode)
         engine.start_stream()
 
     def _reset_main_token(self) -> None:
@@ -2939,8 +2960,9 @@ class StreamMaximizerApp:
 
 
 def main() -> None:
+    auto = any(arg in ("--auto", "-a", "--stream", "-s") for arg in sys.argv[1:])
     try:
-        StreamMaximizerApp().start()
+        StreamMaximizerApp(auto_mode=auto).start()
     except KeyboardInterrupt:
         print()
         Console().warn("exit", "operation interrupted by user")
