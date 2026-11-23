@@ -32,6 +32,7 @@ import random
 import re
 import select
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -1744,11 +1745,25 @@ class GatewayStreamEngine:
         except Exception as exc:
             C.err("gateway", f"connection failed: {exc}")
             C.rule()
-            input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+            if not self.auto_mode:
+                try:
+                    input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+                except (EOFError, KeyboardInterrupt):
+                    pass
             return
 
         C.ok("gateway", "connected")
         self.running = True
+
+        def _handle_term(signum, frame):
+            self.running = False
+
+        try:
+            signal.signal(signal.SIGTERM, _handle_term)
+            signal.signal(signal.SIGINT, _handle_term)
+        except (ValueError, AttributeError):
+            pass
+
         self.start_time = time.time()
         self.counted_stream_seconds = 0.0
         self.user_id = _user_id_from_token(self.state.token) or ""
@@ -1768,7 +1783,11 @@ class GatewayStreamEngine:
 
         if not self.running:
             C.rule()
-            input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+            if not self.auto_mode:
+                try:
+                    input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+                except (EOFError, KeyboardInterrupt):
+                    pass
             return
 
         if self.detected_channel_id:
@@ -2658,7 +2677,11 @@ class GatewayStreamEngine:
             C.info("stream session ended.")
 
         C.rule()
-        input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+        if not self.auto_mode:
+            try:
+                input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
 
 
