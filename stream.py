@@ -32,6 +32,7 @@ import random
 import re
 import select
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -1649,10 +1650,12 @@ class ViewerEngine:
 
 
 class GatewayStreamEngine:
-    def __init__(self, state: State, session: Session, console: Console) -> None:
+    def __init__(self, state: State, session: Session, console: Console, auto_mode: bool = False, auto_rejoin: bool = False) -> None:
         self.state = state
         self.session = session
         self.console = console
+        self.auto_mode = auto_mode
+        self.auto_rejoin = auto_rejoin or auto_mode
         self.ws: MiniWebSocket | None = None
         self.voice_conn: VoiceConnection | None = None
         self.stream_conn: VoiceConnection | None = None
@@ -1677,6 +1680,8 @@ class GatewayStreamEngine:
         self.stream_ever_active = False
         self._stream_recreate_attempts = 0
         self._user_left_vc = False
+        self._user_in_other_vc = False
+        self._saved_stream_seconds = 0.0
         self._was_already_in_vc = False
         self._rejoining_voice = False
         self.viewer_engine: ViewerEngine | None = None
@@ -1695,6 +1700,14 @@ class GatewayStreamEngine:
         self.last_tick_time = 0.0
         self.ready_received = threading.Event()
         self._cached_supplemental_guilds: list[dict] = []
+
+    def _checkpoint_hours(self) -> None:
+        new_secs = self.counted_stream_seconds - self._saved_stream_seconds
+        if new_secs >= 10:
+            self.state.total_stream_hours_claimed += (new_secs / 3600.0)
+            self._saved_stream_seconds = self.counted_stream_seconds
+            self.state.save()
+            self.console.ok("stream", f"checkpointed {format_timer(self.counted_stream_seconds)} ({self.counted_stream_seconds / 3600.0:.2f}h) counted streaming hours to state")
 
     def get_viewer_count(self) -> int:
         members = set(self.channel_members) | set(self.stream_viewer_ids)
@@ -1743,11 +1756,25 @@ class GatewayStreamEngine:
         except Exception as exc:
             C.err("gateway", f"connection failed: {exc}")
             C.rule()
-            input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+            if not self.auto_mode:
+                try:
+                    input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+                except (EOFError, KeyboardInterrupt):
+                    pass
             return
 
         C.ok("gateway", "connected")
         self.running = True
+
+        def _handle_term(signum, frame):
+            self.running = False
+
+        try:
+            signal.signal(signal.SIGTERM, _handle_term)
+            signal.signal(signal.SIGINT, _handle_term)
+        except (ValueError, AttributeError):
+            pass
+
         self.start_time = time.time()
         self.counted_stream_seconds = 0.0
         self.user_id = _user_id_from_token(self.state.token) or ""
@@ -1767,7 +1794,11 @@ class GatewayStreamEngine:
 
         if not self.running:
             C.rule()
-            input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+            if not self.auto_mode:
+                try:
+                    input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+                except (EOFError, KeyboardInterrupt):
+                    pass
             return
 
         if self.detected_channel_id:
@@ -1784,7 +1815,23 @@ class GatewayStreamEngine:
             C.info("no active voice channel detected on discord client.")
             target_guild_id = ""
             target_channel_id = ""
-            while True:
+            if self.auto_mode and self.state.last_channel_id:
+                default_cid = self.state.last_channel_id
+                cid = extract_channel_id(default_cid)
+                valid, gid, name = validate_stream_target(
+                    token=self.state.token,
+                    super_props=self.session.super_props,
+                    channel_id=cid,
+                    console=C,
+                )
+                if valid:
+                    target_channel_id = cid
+                    target_guild_id = gid
+                    self.channel_name = name
+                    self.state.last_guild_id = gid
+                    self.state.last_channel_id = cid
+                    self.state.save()
+            while not target_channel_id:
                 default_cid = self.state.last_channel_id
                 prompt_str = f"  {C.GREY}voice channel id (or link)" + (f" [default: {default_cid}]:{C.RESET} " if default_cid else f":{C.RESET} ")
                 raw_in = input(prompt_str).strip()
@@ -1936,6 +1983,14 @@ class GatewayStreamEngine:
             time.sleep(10)
             if not self.running:
                 break
+
+            if self._user_in_other_vc:
+                counted_hours = self.counted_stream_seconds / 3600.0
+                timer_str = format_timer(self.counted_stream_seconds)
+                status = f"{self.console.YELLOW}⏸️ PAUSED (in another VC){self.console.RESET}"
+                self.console.live("stream", f"{status} · {timer_str} ({counted_hours:.2f}h) counted {self.console.GREY}(will auto-resume when you leave other channel){self.console.RESET}")
+                continue
+
             if self.voice_conn and (getattr(self.voice_conn, "closed", False) or not self.voice_conn.running or not self.voice_conn.ws or self.voice_conn.ws.closed):
                 self.voice_connected = False
             if self.stream_conn and (getattr(self.stream_conn, "closed", False) or not self.stream_conn.running or not self.stream_conn.ws or self.stream_conn.ws.closed):
@@ -1961,7 +2016,7 @@ class GatewayStreamEngine:
                 disconnected_ticks += 1
                 status = f"{self.console.YELLOW}⏳ reconnecting{self.console.RESET}"
                 self.console.live("stream", f"{status} · {timer_str} ({counted_hours:.2f}h) counted")
-                if disconnected_ticks >= 2 and not self._user_left_vc:
+                if disconnected_ticks >= 2 and not self._user_left_vc and not self._user_in_other_vc:
                     self.console.warn("watchdog", "voice/stream connection stalled — triggering auto-recovery...")
                     self._force_rejoin_voice()
                     disconnected_ticks = 0
@@ -2306,29 +2361,89 @@ class GatewayStreamEngine:
 
                 if vs_channel_id and str(vs_channel_id) == str(self.channel_id):
                     self._rejoining_voice = False
+                    if self._user_in_other_vc:
+                        self._user_in_other_vc = False
+                        C.ok("voice", f"user returned to stream channel #{self.channel_name}!")
+                        if not self.stream_connected:
+                            self._force_rejoin_voice()
 
-                if (self.voice_connected or self.stream_connected or self.stream_ever_active):
-                    if vs_channel_id is None:
+                if (self.voice_connected or self.stream_connected or self.stream_ever_active or self._user_in_other_vc):
+                    if self.channel_id and vs_channel_id and str(vs_channel_id) != str(self.channel_id):
+                        if not self._user_in_other_vc:
+                            self._user_in_other_vc = True
+                            C.warn("voice", f"user moved to another voice channel ({vs_channel_id}) in Discord app — pausing stream")
+                            self._checkpoint_hours()
+
+                            if self.stream_conn:
+                                try:
+                                    self.stream_conn.close()
+                                except Exception:
+                                    pass
+                                self.stream_conn = None
+                            if self.voice_conn:
+                                try:
+                                    self.voice_conn.close()
+                                except Exception:
+                                    pass
+                                self.voice_conn = None
+                            self.voice_connected = False
+                            self.stream_connected = False
+
+                            if self.auto_rejoin:
+                                C.info("voice", f"stream paused. Bot will automatically re-join #{self.channel_name} as soon as you leave that voice channel!")
+                            else:
+                                self._user_left_vc = True
+                                self.running = False
+                        return
+
+                    elif vs_channel_id is None:
+                        if self._user_in_other_vc:
+                            self._user_in_other_vc = False
+                            if self.auto_rejoin:
+                                C.ok("voice", f"user left other voice channel — automatically re-joining stream channel #{self.channel_name} in 1.5s...")
+                                def _delayed_rejoin():
+                                    time.sleep(1.5)
+                                    if self.running and not self._user_in_other_vc and not self.stream_connected:
+                                        self._force_rejoin_voice()
+                                threading.Thread(target=_delayed_rejoin, daemon=True).start()
+                                return
+
                         if self._rejoining_voice:
                             return
-                        if not self.voice_conn or self.voice_conn.ws is None or self.voice_conn.ws.closed:
-                            C.warn("voice", "user manually disconnected from voice channel in Discord app")
-                            C.info("gracefully stopping stream engine and saving accumulated stream hours...")
-                            self._user_left_vc = True
-                            self.voice_connected = False
-                            self.stream_connected = False
-                            self.running = False
-                            return
 
-                    elif self.channel_id and str(vs_channel_id) != str(self.channel_id):
                         if not self.voice_conn or self.voice_conn.ws is None or self.voice_conn.ws.closed:
-                            C.warn("voice", f"user moved to another voice channel ({vs_channel_id}) in Discord app")
-                            C.info("stopping stream on old channel and saving accumulated stream hours...")
-                            self._user_left_vc = True
-                            self.voice_connected = False
-                            self.stream_connected = False
-                            self.running = False
-                            return
+                            if self.auto_rejoin:
+                                C.warn("voice", f"disconnected from voice channel — auto-rejoining #{self.channel_name} in 3s...")
+                                self._checkpoint_hours()
+                                if self.stream_conn:
+                                    try:
+                                        self.stream_conn.close()
+                                    except Exception:
+                                        pass
+                                    self.stream_conn = None
+                                if self.voice_conn:
+                                    try:
+                                        self.voice_conn.close()
+                                    except Exception:
+                                        pass
+                                    self.voice_conn = None
+                                self.voice_connected = False
+                                self.stream_connected = False
+
+                                def _auto_rejoin_vc():
+                                    time.sleep(3.0)
+                                    if self.running and not self._user_in_other_vc and not self.stream_connected:
+                                        self._force_rejoin_voice()
+                                threading.Thread(target=_auto_rejoin_vc, daemon=True).start()
+                                return
+                            else:
+                                C.warn("voice", "user manually disconnected from voice channel in Discord app")
+                                C.info("gracefully stopping stream engine and saving accumulated stream hours...")
+                                self._user_left_vc = True
+                                self.voice_connected = False
+                                self.stream_connected = False
+                                self.running = False
+                                return
 
                 C.ok("voice", f"voice state updated (session: {self.voice_session_id[:8]}...)")
             else:
@@ -2620,10 +2735,13 @@ class GatewayStreamEngine:
             self.ws.close()
 
         if (self.stream_connected or self.stream_ever_active):
+            new_secs = self.counted_stream_seconds - self._saved_stream_seconds
+            if new_secs > 0:
+                self.state.total_stream_hours_claimed += (new_secs / 3600.0)
+                self._saved_stream_seconds = self.counted_stream_seconds
             counted_hours = self.counted_stream_seconds / 3600.0
             elapsed_wall = time.time() - self.start_time if self.start_time > 0 else 0.0
             if self.counted_stream_seconds >= 10:
-                self.state.total_stream_hours_claimed += counted_hours
                 self.state.total_stream_sessions += 1
                 self.state.save()
                 print()
@@ -2641,7 +2759,11 @@ class GatewayStreamEngine:
             C.info("stream session ended.")
 
         C.rule()
-        input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+        if not self.auto_mode:
+            try:
+                input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
 
 
@@ -2714,10 +2836,12 @@ def inspect_profile(state: State, session: Session, console: Console) -> None:
 
 
 class StreamMaximizerApp:
-    def __init__(self) -> None:
+    def __init__(self, auto_mode: bool = False, auto_rejoin: bool = False) -> None:
         self.console = Console()
         self.state = State.load()
         self.session: Session | None = None
+        self.auto_mode = auto_mode
+        self.auto_rejoin = auto_rejoin or auto_mode
 
     def start(self) -> None:
         C = self.console
@@ -2755,7 +2879,10 @@ class StreamMaximizerApp:
             C.err("crypto", "cryptography package is MISSING! Live video streaming will NOT work. Run: pip install -r requirements.txt")
 
         time.sleep(0.5)
-        self.menu()
+        if self.auto_mode:
+            self.run_gateway_live_streamer()
+        else:
+            self.menu()
 
     def _new_session(self) -> None:
         self.session = Session.new()
@@ -2847,7 +2974,7 @@ class StreamMaximizerApp:
         C.warn("rule 2", f"Discord Settings → Data & Privacy → {C.YELLOW}'Personalize my experience'{C.RESET} must be {C.GREEN}ON{C.RESET}!")
         print()
 
-        engine = GatewayStreamEngine(self.state, self.session, self.console)
+        engine = GatewayStreamEngine(self.state, self.session, self.console, auto_mode=self.auto_mode, auto_rejoin=self.auto_rejoin)
         engine.start_stream()
 
     def _reset_main_token(self) -> None:
@@ -2939,8 +3066,10 @@ class StreamMaximizerApp:
 
 
 def main() -> None:
+    auto = any(arg in ("--auto", "-a", "--stream", "-s") for arg in sys.argv[1:])
+    auto_rejoin = any(arg in ("--auto-rejoin", "--rejoin") for arg in sys.argv[1:]) or auto
     try:
-        StreamMaximizerApp().start()
+        StreamMaximizerApp(auto_mode=auto, auto_rejoin=auto_rejoin).start()
     except KeyboardInterrupt:
         print()
         Console().warn("exit", "operation interrupted by user")
